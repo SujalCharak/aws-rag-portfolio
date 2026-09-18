@@ -1,0 +1,8 @@
+# boto3 is preinstalled in the Lambda Python runtime, but the version
+# baked into that runtime lags behind. S3 Vectors is new enough (GA
+# December 2025) that the runtime's built-in botocore may predate the
+# s3vectors client entirely. Pinning a floor here forces SAM to package
+# a current boto3 into the deployment, overriding the runtime's default.
+# This is a real gotcha: skip this file and s3vectors calls fail with
+# "Unknown service" even though the code is correct.
+boto3>=1.40.0

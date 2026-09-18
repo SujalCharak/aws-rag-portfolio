@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Document retrieval pipeline with evaluation harness.
+  S3 for storage, Lambda for ingest and query, S3 Vectors for the vector store,
+  Bedrock for embeddings and generation.
+
+# Globals apply to every function below unless overridden. Keeping shared
+# settings here means each function definition only states what's different
+# about it, which is what makes the template easy to read at a glance.
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+    Architectures:
+      - x86_64
+
+Parameters:
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Bedrock model used to embed both documents and queries.
+  GenerationModelId:
+    Type: String
+    Default: amazon.nova-micro-v1:0
+    Description: Bedrock model used to generate answers from retrieved chunks.
+  VectorDimension:
+    Type: Number
+    Default: 1024
+    Description: Must match the output dimension of EmbeddingModelId.
+  VectorIndexName:
+    Type: String
+    Default: documents-index
+    Description: >
+      Kept as a parameter, not read back from the resource with GetAtt,
+      because AWS::S3Vectors::Index only exposes IndexArn and CreationTime
+      as GetAtt attributes. IndexName isn't one of them, discovered by
+      running the offline linter before ever touching AWS.
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Storage: raw documents land here. Uploading a file to this bucket is
+  # what kicks off the whole ingest pipeline (see IngestFunction Events).
+  # ---------------------------------------------------------------------
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'rag-portfolio-documents-${AWS::AccountId}'
+      # Blocks all forms of public access. There is no reason a bucket
+      # holding your ingest corpus should ever be reachable from outside
+      # your account, so this is on by default, not something to weigh.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------------
+  # Vector store: S3 Vectors. Two resources - a bucket, then an index
+  # inside it. This is the newest resource type in this template
+  # (CloudFormation support shipped alongside GA in December 2025).
+  # ---------------------------------------------------------------------
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub 'rag-portfolio-vectors-${AWS::AccountId}'
+      # A genuine gotcha, found by deploying and reading the Lambda's error
+      # log: for this resource type, Fn::Ref returns the bucket's ARN, not
+      # its name. That's the opposite of AWS::S3::Bucket, where Ref returns
+      # the plain name. The s3vectors API's vectorBucketName field wants
+      # the plain name (a 3-63 character string), so anywhere below that
+      # needs the name, we spell out the same Fn::Sub expression used here
+      # rather than writing !Ref VectorBucket, which would hand the API an
+      # ARN and fail a length check with a confusing error.
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      IndexName: !Ref VectorIndexName
+      DataType: float32
+      Dimension: !Ref VectorDimension
+      DistanceMetric: cosine
+      # Non-filterable metadata is stored and retrievable but can't be used
+      # in a query filter. We stash the chunk text itself here so the query
+      # Lambda can hand it straight to the generation model without a
+      # second lookup back to S3.
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - chunk_text
+
+  # ---------------------------------------------------------------------
+  # Ingest path: S3 upload -> Lambda -> chunk -> embed -> write to index.
+  # The Events block below is what wires the S3 trigger. SAM expands this
+  # into the bucket notification configuration and the Lambda permission
+  # that allows S3 to invoke the function - both are exactly the things
+  # you'd otherwise wire by hand in the console.
+  # ---------------------------------------------------------------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: rag-portfolio-ingest
+      CodeUri: src/ingest/
+      Handler: app.handler
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          VECTOR_BUCKET_NAME: !Sub 'rag-portfolio-vectors-${AWS::AccountId}'
+          VECTOR_INDEX_NAME: !Ref VectorIndexName
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+      Events:
+        DocumentUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocumentsBucket
+            Events: s3:ObjectCreated:*
+      # This is the least-privilege part. The function gets exactly three
+      # kinds of permission: read the documents bucket, write to the
+      # vector index, and call the embedding model. Nothing else. SAM
+      # merges these Policies into a generated execution role - you never
+      # see or hand-edit the role itself.
+      #
+      # The S3 read permission below is written as a raw Statement with the
+      # bucket ARN spelled out via Fn::Sub, not as SAM's S3ReadPolicy
+      # shorthand (which takes BucketName: !Ref DocumentsBucket). That
+      # shorthand looks simpler but it creates a real problem here: !Ref to
+      # a resource makes CloudFormation record a dependency edge from this
+      # role to the bucket. The bucket already depends on this function
+      # (it needs the function's ARN to wire the upload trigger), and this
+      # function depends on its own role. Role -> Bucket, Bucket ->
+      # Function, Function -> Role: a closed loop, which CloudFormation
+      # refuses to deploy. Spelling the same ARN out with Fn::Sub (which
+      # only uses the account ID pseudo parameter, not a reference to the
+      # bucket resource) gets the function the identical permission
+      # without creating that dependency edge, so the loop never forms.
+      # This is a known, documented CloudFormation limitation whenever one
+      # resource both triggers a Lambda and grants that Lambda permissions
+      # on itself, not a one off workaround specific to this project.
+      Policies:
+        - Statement:
+            - Sid: ReadDocuments
+              Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::rag-portfolio-documents-${AWS::AccountId}/*'
+            - Sid: WriteVectors
+              Effect: Allow
+              Action:
+                - s3vectors:PutVectors
+                - s3vectors:GetIndex
+              Resource: !GetAtt VectorIndex.IndexArn
+            - Sid: InvokeEmbeddingModel
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+
+  # ---------------------------------------------------------------------
+  # Query path: HTTP request -> Lambda -> embed query -> search index ->
+  # generate answer. HttpApi is SAM's shorthand for API Gateway's cheaper,
+  # simpler HTTP API (as opposed to the older REST API type) - the right
+  # choice here since we don't need REST API's extra features.
+  # ---------------------------------------------------------------------
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: rag-portfolio-query
+      CodeUri: src/query/
+      Handler: app.handler
+      Environment:
+        Variables:
+          VECTOR_BUCKET_NAME: !Sub 'rag-portfolio-vectors-${AWS::AccountId}'
+          VECTOR_INDEX_NAME: !Ref VectorIndexName
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+          GENERATION_MODEL_ID: !Ref GenerationModelId
+      Events:
+        QueryApi:
+          Type: HttpApi
+          Properties:
+            Path: /query
+            Method: post
+      Policies:
+        - Statement:
+            - Sid: SearchVectors
+              Effect: Allow
+              Action:
+                - s3vectors:QueryVectors
+                # QueryVectors alone only returns vector keys and distances.
+                # Our query code sets returnMetadata=True to get chunk_text
+                # back (see src/query/app.py), and AWS requires this second,
+                # separately named permission for that specific case, on
+                # top of QueryVectors. Confirmed against AWS's own docs
+                # after hitting the AccessDeniedException in production,
+                # since the permission name doesn't obviously map to the
+                # returnMetadata parameter that triggers the requirement.
+                - s3vectors:GetVectors
+                - s3vectors:GetIndex
+              Resource: !GetAtt VectorIndex.IndexArn
+            - Sid: InvokeModels
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+                - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${GenerationModelId}'
+
+Outputs:
+  DocumentsBucketName:
+    Description: Upload documents here to trigger ingestion.
+    Value: !Ref DocumentsBucket
+  QueryApiEndpoint:
+    Description: 'POST a JSON body like {"question": "..."} here.'
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/query'
+  VectorIndexArn:
+    Description: ARN of the S3 Vectors index, useful for the eval harness later.
+    Value: !GetAtt VectorIndex.IndexArn

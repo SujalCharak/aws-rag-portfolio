@@ -1,0 +1,2 @@
+# See src/ingest/requirements.txt for why this pin matters.
+boto3>=1.40.0
