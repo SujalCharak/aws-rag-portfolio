@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Default to read only. The deploy job widens this for itself; nothing
+# else in this file gets write access to anything.
+permissions:
+  contents: read
+
+jobs:
+
+  # Tests, lint, and a build. No AWS credentials anywhere in this job,
+  # which is the point: if the unit tests needed cloud access to run,
+  # they would be slow, flaky, and unusable on pull requests from forks.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install pytest boto3
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -v
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # Catches template errors (bad GetAtt attributes, circular
+      # dependencies, malformed YAML) without deploying. Every one of
+      # those has already bitten this project at least once.
+      - name: Validate template
+        run: sam validate --lint --region us-east-1
+
+      # Catches packaging errors: a dependency that will not install, a
+      # handler path that does not resolve.
+      - name: Build
+        run: sam build
+
+  deploy:
+    needs: test
+    # Only from main, only on a real push. A pull request that merely
+    # targets main must not be able to deploy, which is why the event
+    # type is checked as well as the ref.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for OIDC. Without this line the credentials step fails
+      # with a confusing "could not load credentials" error, and it is
+      # the single most common reason a first OIDC setup does not work.
+      # It lets the job request an identity token from GitHub; it grants
+      # no write access to the repository.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Assume deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # An ARN is an identifier, not a secret, so this could be
+          # written inline. It is a repository variable instead so the
+          # account id is not published when the repo goes public.
+          # Set it under Settings > Secrets and variables > Actions >
+          # Variables, named AWS_DEPLOY_ROLE_ARN.
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: github-actions-${{ github.run_id }}
+
+      - name: Build
+        run: sam build
+
+      # samconfig.toml is gitignored (it is account specific), so every
+      # deploy argument is passed explicitly here. That turns out to be
+      # the better shape for CI anyway: the deploy is fully described by
+      # this file rather than by a file that happens to be on someone's
+      # laptop.
+      #
+      # --no-confirm-changeset because nobody is present to type y.
+      # --no-fail-on-empty-changeset because a commit that touches only
+      # README or tests produces no infrastructure change, and that is a
+      # successful run, not a failed one.
+      - name: Deploy
+        run: |
+          sam deploy \
+            --stack-name rag-portfolio \
+            --region us-east-1 \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset

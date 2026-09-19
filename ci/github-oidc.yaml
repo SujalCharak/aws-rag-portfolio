@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bootstrap stack: lets GitHub Actions deploy this project without any
+  long lived AWS credentials stored in GitHub. Deploy this once, by
+  hand, before the CI workflow can work.
+
+# Deploy this stack with:
+#
+#   aws cloudformation deploy \
+#     --template-file ci/github-oidc.yaml \
+#     --stack-name rag-portfolio-ci \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides GitHubOrg=YOUR_GITHUB_USERNAME
+#
+# It is a separate stack from the application on purpose. The role
+# created here is what deploys the application stack, so it has to exist
+# first: an application stack cannot create the credentials used to
+# deploy itself.
+#
+# How OIDC replaces stored keys:
+#
+# The usual shortcut is to create an IAM access key and paste it into
+# GitHub secrets. That key is long lived, sits in a third party system,
+# works from anywhere, and keeps working until someone remembers to
+# rotate it. With OIDC, GitHub mints a short lived token describing the
+# workflow run, AWS validates it against the trust policy below, and
+# hands back credentials that expire in an hour. Nothing durable is
+# stored anywhere.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub username or organization that owns the repository.
+  GitHubRepo:
+    Type: String
+    Default: aws-rag-portfolio
+    Description: Repository name.
+  GitHubRef:
+    Type: String
+    Default: refs/heads/main
+    Description: >
+      Which git ref is allowed to assume the deploy role. Deploys happen
+      only from main, so only main is trusted. Pull request builds run
+      tests, which need no AWS access at all.
+  ApplicationStackName:
+    Type: String
+    Default: rag-portfolio
+    Description: Name of the application stack this role may deploy.
+  ResourcePrefix:
+    Type: String
+    Default: rag-portfolio
+    Description: Name prefix the deploy role is allowed to manage.
+
+Resources:
+
+  # -------------------------------------------------------------------
+  # Registers GitHub as an identity provider AWS will accept tokens from.
+  # One per account; if you already have this, delete this resource and
+  # point the role below at the existing provider's ARN instead.
+  # -------------------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS validates GitHub's certificate against its own trust store
+      # now, so this thumbprint is vestigial. Kept because older tooling
+      # and a lot of existing documentation still expect the field.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  # -------------------------------------------------------------------
+  # The role GitHub Actions assumes. Two halves matter independently:
+  # who may assume it (trust policy), and what it may then do (permissions).
+  # -------------------------------------------------------------------
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-github-deploy'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # Without this audience check the token could have been
+                # minted for some other service entirely.
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # The single most important line in this file. The sub
+                # claim identifies which repository and which ref the
+                # workflow ran from. A trust policy that omits it, or
+                # uses a wildcard like repo:*, lets any GitHub repository
+                # anywhere in the world assume this role. This is a real
+                # and frequently made mistake, not a theoretical one.
+                # StringEquals rather than StringLike keeps it exact.
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:${GitHubRef}'
+      Policies:
+        - PolicyName: deploy-application-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # CloudFormation, scoped to this one stack plus the SAM
+              # transform, which CloudFormation needs permission to run
+              # in order to expand AWS::Serverless::* resources.
+              - Sid: ManageApplicationStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+
+              # SAM uploads build artifacts to a managed bucket it
+              # creates on first use, named aws-sam-cli-managed-*.
+              - Sid: SamArtifactBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:ListBucket
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketVersioning
+                  - s3:GetBucketVersioning
+                  - s3:PutBucketPublicAccessBlock
+                Resource:
+                  - arn:aws:s3:::aws-sam-cli-managed-*
+                  - arn:aws:s3:::aws-sam-cli-managed-*/*
+
+              # The application's own buckets.
+              - Sid: ApplicationBuckets
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:GetBucket*
+                  - s3:PutBucket*
+                  - s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${ResourcePrefix}-*'
+
+              # Lambda functions, scoped by name prefix.
+              - Sid: ManageFunctions
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                  - lambda:PutFunctionConcurrency
+                  - lambda:DeleteFunctionConcurrency
+                  - lambda:PutFunctionEventInvokeConfig
+                  - lambda:UpdateFunctionEventInvokeConfig
+                  - lambda:DeleteFunctionEventInvokeConfig
+                  - lambda:GetFunctionEventInvokeConfig
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-*'
+
+              # The queue and the vector store.
+              - Sid: ManageQueueAndVectors
+                Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueAttributes
+                  - sqs:SetQueueAttributes
+                  - sqs:TagQueue
+                Resource: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ResourcePrefix}-*'
+              - Sid: ManageVectorStore
+                Effect: Allow
+                Action:
+                  - s3vectors:CreateVectorBucket
+                  - s3vectors:DeleteVectorBucket
+                  - s3vectors:GetVectorBucket
+                  - s3vectors:ListVectorBuckets
+                  - s3vectors:CreateIndex
+                  - s3vectors:DeleteIndex
+                  - s3vectors:GetIndex
+                  - s3vectors:ListIndexes
+                  - s3vectors:TagResource
+                Resource: '*'
+
+              # API Gateway has no useful ARN pattern to scope against at
+              # creation time, since the API id is generated by AWS.
+              - Sid: ManageHttpApi
+                Effect: Allow
+                Action:
+                  - apigateway:POST
+                  - apigateway:GET
+                  - apigateway:PATCH
+                  - apigateway:PUT
+                  - apigateway:DELETE
+                Resource: '*'
+
+              - Sid: ManageLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-*'
+
+              # The honest caveat, worth being able to say out loud:
+              #
+              # Deploying this stack means creating the Lambda execution
+              # roles it defines, so this role can create IAM roles. Any
+              # principal that can create a role and attach policies to
+              # it can, with enough steps, grant itself more than it
+              # started with. Scoping by name prefix narrows that, but
+              # does not close it.
+              #
+              # The production answer is a permissions boundary: a policy
+              # attached here that caps what any role this role creates
+              # is ever allowed to do. That is deliberately left out to
+              # keep this template readable, and named here rather than
+              # quietly omitted.
+              - Sid: ManageExecutionRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ApplicationStackName}-*'
+
+Outputs:
+  DeployRoleArn:
+    Description: >
+      Put this in the CI workflow as the role to assume. It is an
+      identifier, not a credential, so it is safe to commit.
+    Value: !GetAtt GitHubDeployRole.Arn

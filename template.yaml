@@ -29,6 +29,22 @@ Parameters:
     Type: Number
     Default: 1024
     Description: Must match the output dimension of EmbeddingModelId.
+  IngestConcurrencyLimit:
+    Type: Number
+    Default: 0
+    Description: >
+      Caps how many ingest Lambdas run at once, to keep a bulk upload from
+      generating more concurrent calls to Bedrock's embedding endpoint
+      than its quota survives. 0 means "do not reserve", the default,
+      because AWS requires at least 100 units of unreserved concurrency
+      to remain in the account after any reservation, and a new account's
+      total limit is often only 10, below that floor already. On such an
+      account, the account-wide limit itself is the concurrency cap; this
+      parameter has nothing left to add until AWS raises that limit
+      (automatic over time, or requestable in Service Quotas). Once your
+      account limit is comfortably above 100, set this to a positive
+      number, 5 is reasonable, to stop the ingest function from
+      consuming the whole account's concurrency by itself.
   VectorIndexName:
     Type: String
     Default: documents-index
@@ -37,6 +53,16 @@ Parameters:
       because AWS::S3Vectors::Index only exposes IndexArn and CreationTime
       as GetAtt attributes. IndexName isn't one of them, discovered by
       running the offline linter before ever touching AWS.
+
+Conditions:
+  # CloudFormation has no notion of "0 means don't set this property", so
+  # the choice is made explicit here instead: below this Condition,
+  # ReservedConcurrentExecutions is included only when the parameter is
+  # non-zero, and left out of the resource entirely otherwise. Passing
+  # ReservedConcurrentExecutions: 0 directly, rather than omitting the
+  # property, would tell Lambda to allow zero concurrent executions,
+  # which is a very different thing from "don't reserve any".
+  ShouldReserveIngestConcurrency: !Not [!Equals [!Ref IngestConcurrencyLimit, 0]]
 
 Resources:
 
@@ -92,6 +118,23 @@ Resources:
           - chunk_text
 
   # ---------------------------------------------------------------------
+  # Dead letter queue. S3 triggers Lambda asynchronously, which means a
+  # failed invocation is retried a couple of times and then silently
+  # dropped. For a bulk load that's the worst possible behavior: you'd
+  # have no idea which documents never made it in, and a retrieval system
+  # quietly missing 3% of its corpus still returns plausible answers.
+  # Failed events land here instead, so "did everything land?" is a
+  # question with an actual answer (queue depth zero, or not).
+  # ---------------------------------------------------------------------
+  IngestDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: rag-portfolio-ingest-dlq
+      # 14 days, the maximum. A DLQ that expires messages before anyone
+      # looks at them is just a slower way of losing them.
+      MessageRetentionPeriod: 1209600
+
+  # ---------------------------------------------------------------------
   # Ingest path: S3 upload -> Lambda -> chunk -> embed -> write to index.
   # The Events block below is what wires the S3 trigger. SAM expands this
   # into the bucket notification configuration and the Lambda permission
@@ -104,8 +147,26 @@ Resources:
       FunctionName: rag-portfolio-ingest
       CodeUri: src/ingest/
       Handler: app.handler
-      Timeout: 120
+      # 15 minutes, Lambda's maximum. One JSONL shard now carries many
+      # documents, and each chunk is a separate embedding call, so a
+      # shard takes minutes rather than seconds. If a shard ever needs
+      # more than 15 minutes, the answer is smaller shards, not a
+      # different compute service, but that's the ceiling to know about.
+      Timeout: 900
       MemorySize: 512
+      ReservedConcurrentExecutions: !If
+        - ShouldReserveIngestConcurrency
+        - !Ref IngestConcurrencyLimit
+        - !Ref AWS::NoValue
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt IngestDeadLetterQueue.Arn
+      EventInvokeConfig:
+        # Two retries before giving up and sending to the DLQ. Embedding
+        # throttles are transient, so a retry often succeeds; a malformed
+        # document never will, and shouldn't be retried forever.
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
       Environment:
         Variables:
           VECTOR_BUCKET_NAME: !Sub 'rag-portfolio-vectors-${AWS::AccountId}'
@@ -217,3 +278,8 @@ Outputs:
   VectorIndexArn:
     Description: ARN of the S3 Vectors index, useful for the eval harness later.
     Value: !GetAtt VectorIndex.IndexArn
+  IngestDeadLetterQueueUrl:
+    Description: >
+      Check this after a bulk load. A non-zero message count means some
+      documents never made it into the index.
+    Value: !Ref IngestDeadLetterQueue

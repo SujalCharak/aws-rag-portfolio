@@ -6,7 +6,8 @@ generation quality directly, precision, recall, MRR, and groundedness,
 rather than assuming a plausible looking answer means the system works.
 
 Status: core pipeline deployed and verified end to end (ingest and query
-both working against a live stack). Evaluation harness in progress.
+both working against a live stack). SciFact corpus loaded (5183 documents,
+5820 chunks indexed). Evaluation harness in progress.
 
 ## Architecture
 
@@ -42,11 +43,79 @@ CloudFormation stack via AWS SAM. No console clicking for any of it.
 ## Repo layout
 
 ```
-template.yaml           SAM/CloudFormation template: all infrastructure
-src/ingest/app.py       Lambda: chunk, embed, write to vector index
-src/query/app.py        Lambda: retrieve, generate, return with citations
-tests/                  Unit tests for pure logic (no AWS calls)
+template.yaml                 SAM template: all application infrastructure
+ci/github-oidc.yaml           Bootstrap stack: GitHub Actions deploy role
+.github/workflows/ci.yml      Tests and lint on every push, deploy from main
+src/ingest/app.py             Lambda: parse, chunk, embed, write vectors
+src/query/app.py              Lambda: retrieve, generate, return with citations
+scripts/prepare_scifact.py    Download and shard the evaluation corpus
+scripts/count_vectors.py      Count vectors actually stored in the index
+tests/                        Unit tests for pure logic (no AWS calls)
 ```
+
+## Loading a corpus
+
+Documents are ingested as JSONL shards rather than one file per
+document. One S3 object carries many documents, so one upload is one
+Lambda invocation instead of thousands. Uncapped, per document
+invocations would scale Lambda to whatever the account allows and
+throttle the shared Bedrock embedding quota into mass failure; sharding
+plus a reserved concurrency limit makes the load survivable.
+
+```bash
+pip install ir_datasets
+python scripts/prepare_scifact.py          # writes data/corpus and data/eval
+aws s3 cp data/corpus/ s3://<documents-bucket>/corpus/ --recursive
+```
+
+Failed ingests land in an SQS dead letter queue rather than disappearing.
+S3 invokes Lambda asynchronously, so without one, a failed document is
+retried twice and then silently dropped, and a retrieval system quietly
+missing part of its corpus still returns plausible answers. Check the
+queue depth after a load:
+
+```bash
+aws sqs get-queue-attributes \
+  --queue-url <IngestDeadLetterQueueUrl from stack outputs> \
+  --attribute-names ApproximateNumberOfMessages
+```
+
+A non-zero DLQ count after a load doesn't necessarily mean documents are
+missing, it depends on whether the corpus made it in. On the SciFact load,
+the account's Lambda concurrency limit (10, a new account default well
+below the usual 1000) meant 21 near simultaneous shard uploads had to
+compete for 10 execution slots. Some invocation attempts sat throttled
+long enough to exceed the retry budget (`EventInvokeConfig`: 2 retries, 1
+hour max age) and landed in the DLQ, having never actually run. S3's
+at-least-once delivery meant a second delivery of the same event usually
+found a slot and succeeded, which is why every shard still showed up in
+the ingest logs. The fix in that case isn't retrying harder, it's raising
+the account's concurrency limit (Service Quotas) or reserving a smaller
+`IngestConcurrencyLimit` so fewer invocations contend at once. Either way,
+the right way to confirm a load actually succeeded is a direct vector
+count against the index (`scripts/count_vectors.py`), not DLQ depth alone.
+
+## CI/CD
+
+GitHub Actions runs the unit tests, `sam validate --lint`, and `sam
+build` on every push and pull request, then deploys from `main`.
+
+Deploys authenticate through GitHub's OIDC provider, so no AWS
+credentials are stored in GitHub. The workflow requests a short lived
+token describing the run, AWS validates it against a trust policy scoped
+to this exact repository and ref, and returns credentials that expire in
+an hour. Setup is a one time bootstrap stack:
+
+```bash
+aws cloudformation deploy \
+  --template-file ci/github-oidc.yaml \
+  --stack-name rag-portfolio-ci \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GitHubOrg=<your-github-username>
+```
+
+Then set the resulting role ARN as an Actions variable named
+`AWS_DEPLOY_ROLE_ARN`.
 
 ## Deploying
 
