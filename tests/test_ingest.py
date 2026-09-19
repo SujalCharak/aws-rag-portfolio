@@ -16,14 +16,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "ingest"))
 
-import app  # noqa: E402
-from app import (  # noqa: E402
-    build_vectors,
-    chunk_text,
-    clean_doc_id,
-    parse_documents,
-    write_vectors,
-)
+from conftest import load_lambda_module  # noqa: E402
+
+# Loaded by path rather than with `import app`, because the query
+# handler is also called app.py and the two collide in a shared test
+# session. See load_lambda_module in conftest.py.
+app = load_lambda_module("ingest_app", "src", "ingest", "app.py")
+
+build_vectors = app.build_vectors
+chunk_text = app.chunk_text
+clean_doc_id = app.clean_doc_id
+parse_documents = app.parse_documents
+write_vectors = app.write_vectors
 
 
 # --- chunking -----------------------------------------------------------

@@ -27,6 +27,16 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest boto3
 
+      # The metric and agreement tests cross check against the reference
+      # implementations, trec_eval for ranking metrics and scikit-learn
+      # for Cohen's kappa. Both are optional: the tests skip cleanly
+      # when they are missing, so a wheel that fails to build on a new
+      # runner image degrades the validation rather than breaking CI for
+      # a change that has nothing to do with it.
+      - name: Install optional reference implementations
+        continue-on-error: true
+        run: pip install pytrec_eval-terrier scikit-learn
+
       - name: Run unit tests
         run: python -m pytest tests/ -v
 

@@ -48,7 +48,16 @@ template.yaml                 SAM template: all application infrastructure
 ci/github-oidc.yaml           Bootstrap stack: GitHub Actions deploy role
 .github/workflows/ci.yml      Tests and lint on every push, deploy from main
 src/ingest/app.py             Lambda: parse, chunk, embed, write vectors
-src/query/app.py              Lambda: retrieve, generate, return with citations
+src/query/app.py              Lambda: HTTP boundary for the query path
+src/query/retrieval.py        Embed, search, collapse chunks to documents
+src/query/generation.py       Prompt and answer generation
+eval/metrics.py               precision@k, recall@k, MRR, nDCG@k
+eval/run_retrieval_eval.py    Dense retrieval over the labelled query set
+eval/run_bm25_baseline.py     Lexical baseline over the same corpus
+eval/fuse_runs.py             Reciprocal Rank Fusion of two runs
+eval/score_runs.py            Scores every run through one scorer
+eval/run_groundedness.py      Generate, judge, and build labelling sheets
+eval/score_judge.py           Cohen's kappa: judge against hand labels
 scripts/prepare_scifact.py    Download and shard the evaluation corpus
 scripts/count_vectors.py      Count vectors actually stored in the index
 tests/                        Unit tests for pure logic (no AWS calls)
@@ -134,10 +143,64 @@ account specific). After the first guided run, plain `sam deploy` reuses it.
 
 ## Evaluation
 
-Not yet built. Day 3 adds: a labelled query set against a public corpus
-(SciFact), precision at k / recall at k / MRR / nDCG, a BM25 baseline for
-comparison, and groundedness checking on generated answers with the
-judge itself validated against hand labels.
+Retrieval quality is measured against SciFact's human relevance
+judgments rather than inferred from answers looking plausible.
+
+```bash
+python eval/run_retrieval_eval.py      # dense retrieval, caches raw hits
+python eval/run_bm25_baseline.py       # lexical baseline, same corpus
+python eval/fuse_runs.py               # reciprocal rank fusion of the two
+python eval/score_runs.py              # scores every run, prints the table
+```
+
+Each retrieval system writes a run file and `score_runs.py` scores all
+of them through one code path, so the baseline is a comparison rather
+than a second experiment. The retrieval code itself is imported from
+`src/query/`, the same modules the deployed Lambda runs, so the numbers
+describe the deployed system rather than a reimplementation of it.
+
+Three things about these numbers are worth stating before reading them:
+
+- **Precision at depth is capped by the dataset.** SciFact averages 1.13
+  relevant documents per query, so P@10 cannot exceed about 0.11 no
+  matter how good retrieval is. MRR and recall carry the signal here.
+- **BM25 is a serious baseline on this corpus**, not a straw man.
+  Published BEIR results put it around 0.665 nDCG@10 on SciFact, ahead
+  of many dense retrievers, because scientific claims reuse the exact
+  terminology of the abstracts supporting them.
+- **The hybrid row is evaluation time fusion**, combining two separately
+  produced run files. It measures whether the signals complement each
+  other. It is not a hybrid retriever serving live traffic.
+
+### Groundedness
+
+Whether generated answers are actually supported by their retrieved
+context, with the judge itself validated rather than trusted.
+
+```bash
+python eval/run_groundedness.py --sample-size 50
+# fill in data/eval/labels.csv by hand, reading data/eval/label_sheet.md
+python eval/score_judge.py
+```
+
+An LLM judge that is never checked against a human produces a percentage
+with no established meaning, and it looks the same whether the judge is
+careful or is answering "grounded" reflexively. So the same sample is
+labelled by hand and the two sets of labels are compared with Cohen's
+kappa, which corrects for agreement that would happen by chance. A judge
+that always says "grounded" and is right 80% of the time scores 0.
+
+Three details keep that comparison honest. The judge is a different
+model from the one generating the answers, so it is not grading itself.
+The labelling sheet omits the judge's verdicts, so reading them cannot
+anchor the human labels. And both sides are given the identical rubric,
+defined once in `eval/groundedness.py`, so the score measures the judge
+rather than a difference in instructions.
+
+Abstentions are counted separately rather than as grounded. An answer
+that declines to answer asserts nothing unsupported and so is trivially
+grounded, which would let a system that always says "I don't know"
+report a perfect score.
 
 ## Cost
 

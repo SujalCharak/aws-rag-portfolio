@@ -2,84 +2,31 @@
 Query Lambda: takes a question over HTTP, retrieves relevant chunks from
 the S3 Vectors index, and generates an answer grounded in those chunks.
 
-Two different Bedrock call styles show up here on purpose, and the
-difference between them is worth knowing:
-
-- Embeddings use invoke_model with a raw, model specific JSON body.
-  Embedding models don't have a shared response shape across providers,
-  so there's no unified API for them.
-- Generation uses converse(), Bedrock's unified chat API. Any Bedrock
-  chat model, Nova, Claude, Llama, whatever, speaks the same
-  messages in, message out shape through converse(). Swapping
-  GENERATION_MODEL_ID from Nova Micro to a Claude model later is a one
-  line environment variable change, no code change, precisely because
-  this call is unified and the embedding call is not.
+The retrieval and generation steps themselves live in retrieval.py and
+generation.py, which the evaluation harness imports directly. This file
+is the HTTP boundary and nothing else: parse the request, call the same
+code the harness measures, shape the response. Keeping it that thin is
+what lets the reported eval numbers describe this endpoint rather than a
+parallel implementation that resembles it.
 """
 
 import json
 import os
 
-import boto3
+from generation import generate_answer
+from retrieval import embed_text, search_chunks
 
-bedrock = boto3.client("bedrock-runtime")
-s3vectors = boto3.client("s3vectors")
-
+# Read at import time, on purpose. A misconfigured Lambda should fail
+# loudly at cold start rather than limp along with a None and fail
+# confusingly three calls later. The modules above resolve the same
+# variables lazily so they stay importable for unit tests in CI, where
+# no AWS configuration exists; this is the place that insists on them.
 VECTOR_BUCKET_NAME = os.environ["VECTOR_BUCKET_NAME"]
 VECTOR_INDEX_NAME = os.environ["VECTOR_INDEX_NAME"]
 EMBEDDING_MODEL_ID = os.environ["EMBEDDING_MODEL_ID"]
 GENERATION_MODEL_ID = os.environ["GENERATION_MODEL_ID"]
 
 TOP_K = 5
-
-SYSTEM_PROMPT = (
-    "Answer the question using only the context provided below. "
-    "If the context does not contain the answer, say you don't know "
-    "rather than guessing. Keep the answer to two or three sentences."
-)
-
-
-def embed_text(text):
-    body = json.dumps({
-        "inputText": text,
-        "dimensions": 1024,
-        "normalize": True,
-    })
-    response = bedrock.invoke_model(
-        modelId=EMBEDDING_MODEL_ID,
-        body=body,
-        contentType="application/json",
-        accept="application/json",
-    )
-    payload = json.loads(response["body"].read())
-    return payload["embedding"]
-
-
-def retrieve(query_vector, top_k=TOP_K):
-    response = s3vectors.query_vectors(
-        vectorBucketName=VECTOR_BUCKET_NAME,
-        indexName=VECTOR_INDEX_NAME,
-        queryVector={"float32": query_vector},
-        topK=top_k,
-        returnMetadata=True,
-        returnDistance=True,
-    )
-    return response.get("vectors", [])
-
-
-def generate_answer(question, retrieved):
-    context = "\n\n".join(
-        f"[{i+1}] {v['metadata']['chunk_text']}"
-        for i, v in enumerate(retrieved)
-    )
-    user_message = f"Context:\n{context}\n\nQuestion: {question}"
-
-    response = bedrock.converse(
-        modelId=GENERATION_MODEL_ID,
-        system=[{"text": SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": user_message}]}],
-        inferenceConfig={"maxTokens": 512, "temperature": 0.0},
-    )
-    return response["output"]["message"]["content"][0]["text"]
 
 
 def handler(event, context):
@@ -93,7 +40,7 @@ def handler(event, context):
         return _response(400, {"error": "Missing 'question' in request body."})
 
     query_vector = embed_text(question)
-    retrieved = retrieve(query_vector)
+    retrieved = search_chunks(query_vector, top_k=TOP_K)
 
     if not retrieved:
         answer = "No documents have been ingested yet, so there's nothing to search."
@@ -101,10 +48,10 @@ def handler(event, context):
         answer = generate_answer(question, retrieved)
 
     # Returning the retrieved chunks alongside the answer, not just the
-    # answer text, is deliberate: the day 3 evaluation harness needs the
-    # actual retrieved doc_ids and distances to score precision, recall,
-    # and MRR against labelled queries. An API that only returns prose
-    # can't be evaluated this way after the fact.
+    # answer text, is deliberate: the evaluation harness needs the actual
+    # retrieved doc_ids and distances to score precision, recall, and
+    # MRR against labelled queries. An API that only returns prose can't
+    # be evaluated this way after the fact.
     result = {
         "question": question,
         "answer": answer,
