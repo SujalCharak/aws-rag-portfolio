@@ -62,7 +62,7 @@ def read_jsonl(path):
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def retrieve_all(queries, chunk_depth, vector_bucket, index_name):
+def retrieve_all(queries, chunk_depth, vector_bucket, index_name, embedding_model_id):
     """
     Embed and retrieve for every query, sequentially.
 
@@ -76,7 +76,7 @@ def retrieve_all(queries, chunk_depth, vector_bucket, index_name):
     started = time.time()
 
     for i, query in enumerate(queries, start=1):
-        query_vector = embed_text(query["text"])
+        query_vector = embed_text(query["text"], model_id=embedding_model_id)
         hits = search_chunks(
             query_vector,
             top_k=chunk_depth,
@@ -130,6 +130,15 @@ def main():
     parser.add_argument("--doc-depth", type=int, default=10)
     parser.add_argument("--index-name", default="documents-index")
     parser.add_argument("--vector-bucket", default=None)
+    parser.add_argument(
+        "--embedding-model-id",
+        default="amazon.titan-embed-text-v2:0",
+        help=(
+            "must match EmbeddingModelId in template.yaml, since query vectors "
+            "and the stored document vectors have to come from the same model "
+            "to be comparable at all"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--from-cache",
@@ -153,7 +162,9 @@ def main():
         vector_bucket = args.vector_bucket or resolve_vector_bucket()
         print(f"Retrieving for {len(queries)} queries from {vector_bucket}/{args.index_name}")
 
-        hits_by_query = retrieve_all(queries, args.chunk_depth, vector_bucket, args.index_name)
+        hits_by_query = retrieve_all(
+            queries, args.chunk_depth, vector_bucket, args.index_name, args.embedding_model_id
+        )
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(hits_by_query))

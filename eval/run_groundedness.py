@@ -188,6 +188,16 @@ def main():
     parser.add_argument("--index-name", default="documents-index")
     parser.add_argument("--vector-bucket", default=None)
     parser.add_argument("--judge-model", default=None)
+    parser.add_argument(
+        "--embedding-model-id",
+        default="amazon.titan-embed-text-v2:0",
+        help="must match EmbeddingModelId in template.yaml",
+    )
+    parser.add_argument(
+        "--generation-model-id",
+        default="amazon.nova-micro-v1:0",
+        help="must match GenerationModelId in template.yaml, the model actually deployed",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -207,7 +217,7 @@ def main():
     started = time.time()
 
     for i, query in enumerate(sampled, start=1):
-        query_vector = embed_text(query["text"])
+        query_vector = embed_text(query["text"], model_id=args.embedding_model_id)
         hits = search_chunks(
             query_vector,
             top_k=PRODUCTION_TOP_K,
@@ -216,7 +226,7 @@ def main():
         )
 
         context = build_context(hits)
-        answer = generate_answer(query["text"], hits)
+        answer = generate_answer(query["text"], hits, model_id=args.generation_model_id)
         judge_reply = judge_answer(query["text"], context, answer, judge_model)
         label, reason = parse_verdict(judge_reply)
 
