@@ -162,6 +162,15 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*'
                   - !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+                  # sam deploy --resolve-s3 provisions its own bootstrap
+                  # stack under this fixed name, to hold the S3 bucket it
+                  # uploads build artifacts to. It's a one time thing per
+                  # account/region, but the deploy role has to be allowed
+                  # to create and later read it, same as the app stack.
+                  # Found by deploying and reading the resulting
+                  # AccessDenied error, which named the exact stack ARN
+                  # the role was missing, rather than guessing at it.
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*'
 
               # SAM uploads build artifacts to a managed bucket it
               # creates on first use, named aws-sam-cli-managed-*.
