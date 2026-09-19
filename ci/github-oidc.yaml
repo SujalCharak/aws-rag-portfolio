@@ -10,7 +10,14 @@ Description: >
 #     --template-file ci/github-oidc.yaml \
 #     --stack-name rag-portfolio-ci \
 #     --capabilities CAPABILITY_NAMED_IAM \
-#     --parameter-overrides GitHubOrg=YOUR_GITHUB_USERNAME
+#     --parameter-overrides \
+#       GitHubOrg=YOUR_GITHUB_USERNAME \
+#       GitHubOrgId=YOUR_GITHUB_USER_ID \
+#       GitHubRepoId=YOUR_GITHUB_REPO_ID
+#
+# Get the two IDs first:
+#   curl https://api.github.com/users/YOUR_GITHUB_USERNAME | grep '"id"'
+#   curl https://api.github.com/repos/YOUR_GITHUB_USERNAME/aws-rag-portfolio | grep '"id"'
 #
 # It is a separate stack from the application on purpose. The role
 # created here is what deploys the application stack, so it has to exist
@@ -31,10 +38,26 @@ Parameters:
   GitHubOrg:
     Type: String
     Description: GitHub username or organization that owns the repository.
+  GitHubOrgId:
+    Type: String
+    Description: >
+      GitHub's immutable numeric ID for that user or org, not the name.
+      GitHub now embeds this in the OIDC token's sub claim alongside the
+      name (repo:name@id/name@id:ref:...), a real security feature: names
+      can be renamed, or a deleted repo's name reused by someone else, and
+      a trust policy matching name alone would then trust the wrong
+      account. The ID can't be reused that way. Find it with
+      `curl https://api.github.com/users/YOUR_USERNAME` (the "id" field).
   GitHubRepo:
     Type: String
     Default: aws-rag-portfolio
     Description: Repository name.
+  GitHubRepoId:
+    Type: String
+    Description: >
+      GitHub's immutable numeric ID for the repository. Find it with
+      `curl https://api.github.com/repos/YOUR_USERNAME/aws-rag-portfolio`
+      (the "id" field).
   GitHubRef:
     Type: String
     Default: refs/heads/main
@@ -98,7 +121,17 @@ Resources:
                 # anywhere in the world assume this role. This is a real
                 # and frequently made mistake, not a theoretical one.
                 # StringEquals rather than StringLike keeps it exact.
-                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:${GitHubRef}'
+                #
+                # The name@id format (rather than plain name) matches
+                # what GitHub actually sends now: an immutable numeric ID
+                # alongside the mutable name. Matching only on name would
+                # still work today, but would keep trusting whoever holds
+                # that name later even if the org or repo were renamed or
+                # deleted and recreated by someone else. Confirmed against
+                # a live AssumeRoleWithWebIdentity CloudTrail event after
+                # StringEquals on name alone produced a confusing, generic
+                # AccessDenied with no indication of which part mismatched.
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:${GitHubRef}'
       Policies:
         - PolicyName: deploy-application-stack
           PolicyDocument:
