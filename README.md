@@ -7,7 +7,8 @@ rather than assuming a plausible looking answer means the system works.
 
 Status: core pipeline deployed and verified end to end (ingest and query
 both working against a live stack). SciFact corpus loaded (5183 documents,
-5820 chunks indexed). Evaluation harness in progress.
+5820 chunks indexed). CI/CD verified end to end, including a real OIDC
+deploy from GitHub Actions. Evaluation harness in progress.
 
 ## Architecture
 
