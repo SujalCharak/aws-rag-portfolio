@@ -5,10 +5,16 @@ and Bedrock, with an evaluation harness on top that measures retrieval and
 generation quality directly, precision, recall, MRR, and groundedness,
 rather than assuming a plausible looking answer means the system works.
 
-Status: core pipeline deployed and verified end to end (ingest and query
-both working against a live stack). SciFact corpus loaded (5183 documents,
-5820 chunks indexed). CI/CD verified end to end, including a real OIDC
-deploy from GitHub Actions. Evaluation harness in progress.
+Status: core pipeline built and verified end to end, including CI/CD
+via GitHub Actions with OIDC. Retrieval evaluated against SciFact (300
+queries): hybrid retrieval reaches 0.706 nDCG@10, ahead of both a dense
+only and a BM25 only baseline. Full numbers and caveats in
+[RESULTS.md](RESULTS.md). Groundedness judge built and run; independent
+human validation of the judge is the one piece still open.
+
+The AWS stack itself is currently torn down (`sam delete`) between demos
+to avoid an idle unauthenticated endpoint and to keep cost at zero. See
+Deploying below to bring it back up.
 
 ## Architecture
 
@@ -142,6 +148,9 @@ sam deploy --guided            # first deploy: asks stack name, region, confirms
 account specific). After the first guided run, plain `sam deploy` reuses it.
 
 ## Evaluation
+
+Results and their caveats are in [RESULTS.md](RESULTS.md). This section
+covers how to reproduce them.
 
 Retrieval quality is measured against SciFact's human relevance
 judgments rather than inferred from answers looking plausible.
