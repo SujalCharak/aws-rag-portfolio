@@ -261,6 +261,15 @@ Resources:
                   - apigateway:PATCH
                   - apigateway:PUT
                   - apigateway:DELETE
+                  # Separate from the HTTP verb actions above: those map
+                  # to REST calls against API Gateway resource paths,
+                  # tagging is its own named IAM action. SAM's
+                  # AWS::Serverless::HttpApi tags the default stage on
+                  # creation, which failed with AccessDenied until this
+                  # was added, found from the actual CREATE_FAILED
+                  # event naming apigateway:TagResource specifically.
+                  - apigateway:TagResource
+                  - apigateway:UntagResource
                 Resource: '*'
 
               - Sid: ManageLogGroups
