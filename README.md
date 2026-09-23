@@ -8,9 +8,9 @@ rather than assuming a plausible looking answer means the system works.
 Status: core pipeline built and verified end to end, including CI/CD
 via GitHub Actions with OIDC. Retrieval evaluated against SciFact (300
 queries): hybrid retrieval reaches 0.706 nDCG@10, ahead of both a dense
-only and a BM25 only baseline. Full numbers and caveats in
-[RESULTS.md](RESULTS.md). Groundedness judge built and run; independent
-human validation of the judge is the one piece still open.
+only and a BM25 only baseline. Groundedness judge validated against
+independent hand labels: Cohen's kappa 0.693 (substantial agreement).
+Full numbers and caveats in [RESULTS.md](RESULTS.md).
 
 The AWS stack itself is currently torn down (`sam delete`) between demos
 to avoid an idle unauthenticated endpoint and to keep cost at zero. See
